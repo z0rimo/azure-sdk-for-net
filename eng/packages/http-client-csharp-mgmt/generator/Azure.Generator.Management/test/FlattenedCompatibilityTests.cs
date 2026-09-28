@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using Azure.Generator.Management;
+using Azure.Generator.Management.Primitives;
 using Azure.Generator.Management.Tests.Common;
 using Azure.Generator.Management.Tests.TestHelpers;
 using Azure.Generator.Management.Visitors;
@@ -309,6 +310,195 @@ namespace Azure.Generator.Mgmt.Tests
         }
 
         [Test]
+        public void FlattenedEnumWithSamePublicTypeDoesNotRequireMapping()
+        {
+            var status = InputFactory.StringEnum("ProvisioningState", [("Ready", "Ready")],
+                isExtensible: true, clientNamespace: "Samples.Models");
+            var inner = InputFactory.Model("StoreProperties", properties: [InputFactory.Property("provisioningState", status)]);
+            var wrapper = InputFactory.Property("properties", inner);
+            Flatten(wrapper);
+            var input = InputFactory.Model("StoreData", properties: [wrapper]);
+            const string propertyName = "ProvisioningState";
+            var plugin = ManagementMockHelpers.LoadMockPlugin(
+                inputModels: () => [input, inner],
+                inputEnums: () => [status],
+                lastContractCompilation: () => Helpers.BuildCompilation(
+                [
+                    ("LastContract.cs", $$"""
+                    namespace Samples.Models
+                    {
+                        public readonly partial struct ProvisioningState { }
+                        public partial class StoreData
+                        {
+                            public ProvisioningState? {{propertyName}} { get; set; }
+                        }
+                    }
+                    """)
+                ]));
+            var model = plugin.Object.TypeFactory.CreateModel(input)!;
+            using var diagnostics = CaptureDiagnostics(plugin);
+            Visit(model);
+
+            var previousType = model.LastContractView!.Properties.Single(p => p.Name == propertyName).Type;
+            var currentType = model.Properties.Single(p => p.Name == propertyName).Type;
+            Assert.That(currentType.ToString(), Is.EqualTo(previousType.ToString()));
+            Assert.That(currentType.Equals(previousType), Is.False,
+                "The regression requires distinct generator type metadata for the same public C# type.");
+            _ = plugin.Object.GetWriter(model).Write();
+            Assert.That(Encoding.UTF8.GetString(diagnostics.ToArray()), Does.Not.Contain("Cannot preserve flattened property"));
+            Assert.That(Compile(plugin.Object).GetType("Samples.Models.StoreData"), Is.Not.Null);
+        }
+
+        [Test]
+        public void FlattenedGenericLeafNullabilityDistinguishesValueTypesButNotReferences(
+            [Values] bool valueType, [Values] bool nested)
+        {
+            var leaf = valueType ? (InputType)InputPrimitiveType.Int32 : InputPrimitiveType.String;
+            var items = nested ? InputFactory.Array(InputFactory.Array(leaf)) : InputFactory.Array(leaf);
+            var inner = InputFactory.Model("ListProperties", properties: [InputFactory.Property("items", items)]);
+            var wrapper = InputFactory.Property("properties", inner);
+            Flatten(wrapper);
+            var input = InputFactory.Model("ListData", properties: [wrapper]);
+            var plugin = ManagementMockHelpers.LoadMockPlugin(inputModels: () => [input, inner]);
+            var model = plugin.Object.TypeFactory.CreateModel(input)!;
+            var innerModel = plugin.Object.TypeFactory.CreateModel(inner)!;
+            var oldType = ChangeLeafNullability(innerModel.Properties.Single(p => p.Name == "Items").Type).WithNullable(true);
+            var previous = new ContractView(model.Name);
+            previous.ContractProperties =
+            [
+                new PropertyProvider(null, MethodSignatureModifiers.Public, oldType, "Items", new AutoPropertyBody(true), previous)
+            ];
+            ModelTestHelper.SetLastContractView(model, previous);
+
+            using var diagnostics = CaptureDiagnostics(plugin);
+            Visit(model);
+            var currentType = model.Properties.Single(p => p.Name == "Items").Type;
+            Assert.That(oldType.FullyQualifiedName, Is.EqualTo(currentType.FullyQualifiedName));
+            var messages = Encoding.UTF8.GetString(diagnostics.ToArray());
+            Assert.That(messages.Contains("Cannot preserve flattened property"), Is.EqualTo(valueType),
+                "Nullable reference annotations do not change generic type identity, but Nullable<T> does.");
+        }
+
+        private static CSharpType ChangeLeafNullability(CSharpType type)
+            => type.Arguments.Count == 0
+                ? type.WithNullable(!type.IsNullable)
+                : new CSharpType(type.FrameworkType, type.IsNullable, type.Arguments.Select(ChangeLeafNullability).ToArray());
+
+        [Test]
+        public void HistoricalConstructorComparesNestedReferenceAnnotationsButKeepsValueNullability(
+            [Values] bool nullableReference, [Values] bool nullableValue)
+        {
+            var (plugin, model, _) = CreateCapacityModel(safeFlatten: false, wrapperRequired: false);
+            Visit(model);
+            var flattened = model.Properties.OfType<FlattenedPropertyProvider>().Single(p => p.Name == "Size");
+            var previous = new ContractView(model.Name);
+            var currentKeyType = new CSharpType(typeof(KeyValuePair<,>), typeof(string), typeof(int));
+            var previousKeyType = new CSharpType(typeof(KeyValuePair<,>),
+                new CSharpType(typeof(string), isNullable: nullableReference),
+                new CSharpType(typeof(int), isNullable: nullableValue));
+            var leaf = flattened.AsParameter;
+            var currentParameters = new[] { leaf, new ParameterProvider("key", $"", currentKeyType, Default) };
+            var previousParameters = new[] { leaf, new ParameterProvider("key", $"", previousKeyType, Default) };
+            model.Update(constructors:
+            [
+                new ConstructorProvider(new ConstructorSignature(model.Type, null, MethodSignatureModifiers.Public, currentParameters),
+                    MethodBodyStatement.Empty, model)
+            ]);
+            previous.ContractConstructors =
+            [
+                new ConstructorProvider(new ConstructorSignature(previous.Type, null, MethodSignatureModifiers.Public, previousParameters),
+                    MethodBodyStatement.Empty, previous)
+            ];
+            ModelTestHelper.SetLastContractView(model, previous);
+
+            using var diagnostics = CaptureDiagnostics(plugin);
+            ModelCompatibilityValidator.ValidateFlattenedConstructors(model);
+            var messages = Encoding.UTF8.GetString(diagnostics.ToArray());
+            Assert.That(messages.Contains("Cannot preserve historical constructor"), Is.EqualTo(nullableValue),
+                "Only nullable value-type arguments change a constructed generic type's CLR signature.");
+        }
+
+        [Test]
+        public void RestoredFlattenedEnumConstructorDoesNotRequireMapping()
+        {
+            var status = InputFactory.StringEnum("ProvisioningState", [("Ready", "Ready")],
+                isExtensible: true, clientNamespace: "Samples.Models");
+            var inner = InputFactory.Model("StoreProperties", properties:
+                [InputFactory.Property("provisioningState", status, isRequired: true)]);
+            var wrapper = InputFactory.Property("properties", inner, isRequired: true);
+            Flatten(wrapper);
+            var input = InputFactory.Model("StoreData", properties: [wrapper]);
+            var plugin = ManagementMockHelpers.LoadMockPlugin(
+                inputModels: () => [input, inner],
+                inputEnums: () => [status],
+                lastContractCompilation: () => Helpers.BuildCompilation(
+                [
+                    ("LastContract.cs", """
+                    namespace Samples.Models
+                    {
+                        public readonly partial struct ProvisioningState { }
+                        public partial class StoreData
+                        {
+                            public StoreData(ProvisioningState provisioningState) { }
+                            public ProvisioningState ProvisioningState { get; set; }
+                        }
+                    }
+                    """)
+                ]));
+            var model = plugin.Object.TypeFactory.CreateModel(input)!;
+            using var diagnostics = CaptureDiagnostics(plugin);
+            Visit(model);
+            ManagementMockHelpers.ProcessTypeForBackCompatibility(model);
+            _ = plugin.Object.GetWriter(model).Write();
+
+            Assert.That(Encoding.UTF8.GetString(diagnostics.ToArray()), Does.Not.Contain("Cannot preserve historical constructor"));
+            Assert.That(model.Constructors.Any(c => c.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Public)
+                && c.Signature.Parameters.Count == 1
+                && c.Signature.Parameters[0].Type.ToString() == "global::Samples.Models.ProvisioningState"), Is.True);
+            var assembly = Compile(plugin.Object);
+            var storeType = assembly.GetType("Samples.Models.StoreData")!;
+            var statusType = assembly.GetType("Samples.Models.ProvisioningState")!;
+            Assert.That(storeType.GetConstructor([statusType]), Is.Not.Null);
+        }
+
+        [Test]
+        public void FlattenedTypeChangedFromEnumToStructRequiresMapping()
+        {
+            var status = InputFactory.StringEnum("ProvisioningState", [("Ready", "Ready")],
+                isExtensible: true, clientNamespace: "Samples.Models");
+            var inner = InputFactory.Model("StoreProperties", properties: [InputFactory.Property("provisioningState", status)]);
+            var wrapper = InputFactory.Property("properties", inner);
+            Flatten(wrapper);
+            var input = InputFactory.Model("StoreData", properties: [wrapper]);
+            var plugin = ManagementMockHelpers.LoadMockPlugin(
+                inputModels: () => [input, inner],
+                inputEnums: () => [status],
+                lastContractCompilation: () => Helpers.BuildCompilation(
+                [
+                    ("LastContract.cs", """
+                    namespace Samples.Models
+                    {
+                        public enum ProvisioningState { Ready }
+                        public partial class StoreData
+                        {
+                            public ProvisioningState? ProvisioningState { get; set; }
+                        }
+                    }
+                    """)
+                ]));
+            var model = plugin.Object.TypeFactory.CreateModel(input)!;
+            using var diagnostics = CaptureDiagnostics(plugin);
+            Visit(model);
+
+            var previousType = model.LastContractView!.Properties.Single(p => p.Name == "ProvisioningState").Type;
+            var currentType = model.Properties.Single(p => p.Name == "ProvisioningState").Type;
+            Assert.That(previousType.ToString(), Is.EqualTo(currentType.ToString()));
+            Assert.That(previousType.IsStruct, Is.False);
+            Assert.That(currentType.IsStruct, Is.True);
+            Assert.That(Encoding.UTF8.GetString(diagnostics.ToArray()), Does.Contain("Cannot preserve flattened property"));
+        }
+
+        [Test]
         public void IncompatibleLeafTypeRequiresMappingUnlessCustomized([Values] bool safeFlatten, [Values] bool customized)
         {
             var (plugin, model, _) = CreateCapacityModel(safeFlatten, wrapperRequired: false);
@@ -575,7 +765,7 @@ namespace Azure.Generator.Mgmt.Tests
 
         private static Assembly Compile(ManagementClientGenerator plugin, bool includeFactory = false)
         {
-            var types = plugin.OutputLibrary.TypeProviders.Where(t => t is ModelProvider
+            var types = plugin.OutputLibrary.TypeProviders.Where(t => t is ModelProvider or EnumProvider
                 || (includeFactory && t is ModelFactoryProvider)
                 || t.Name is "Argument" or "Optional" or "ChangeTrackingList" or "ChangeTrackingDictionary"
                     or "ModelSerializationExtensions" or "TypeFormatters" or "SerializationFormat" or "SamplesContext").ToArray();
@@ -605,10 +795,12 @@ namespace Azure.Generator.Mgmt.Tests
         {
             public PropertyProvider[] ContractProperties { get; set; } = [];
             public MethodProvider[] ContractMethods { get; set; } = [];
+            public ConstructorProvider[] ContractConstructors { get; set; } = [];
             protected override string BuildName() => name;
             protected override string BuildRelativeFilePath() => $"{Name}.cs";
             protected override PropertyProvider[] BuildProperties() => ContractProperties;
             protected override MethodProvider[] BuildMethods() => ContractMethods;
+            protected override ConstructorProvider[] BuildConstructors() => ContractConstructors;
         }
     }
 }
