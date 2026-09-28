@@ -1511,7 +1511,7 @@ namespace Azure.ResourceManager.ProviderHub.Models
         /// <param name="apiVersion"> The api version. </param>
         /// <param name="zones"> The zones. </param>
         /// <returns> A new <see cref="Models.ResourceTypeEndpointBase"/> instance for mocking. </returns>
-        public static ResourceTypeEndpointBase ResourceTypeEndpointBase(bool enabled = default, IEnumerable<string> apiVersions = default, Uri endpointUri = default, IEnumerable<string> locations = default, IEnumerable<string> requiredFeatures = default, FeaturesPolicy requiredFeaturesPolicy = default, TimeSpan timeout = default, ProviderEndpointType endpointType = default, ProviderDstsConfiguration dstsConfiguration = default, string skuLink = default, string apiVersion = default, IEnumerable<string> zones = default)
+        public static ResourceTypeEndpointBase ResourceTypeEndpointBase(bool enabled = default, IEnumerable<string> apiVersions = default, Uri endpointUri = default, IEnumerable<string> locations = default, IEnumerable<string> requiredFeatures = default, FeaturesPolicy? requiredFeaturesPolicy = default, TimeSpan timeout = default, ProviderEndpointType endpointType = default, ProviderDstsConfiguration dstsConfiguration = default, string skuLink = default, string apiVersion = default, IEnumerable<string> zones = default)
         {
             apiVersions ??= new ChangeTrackingList<string>();
             locations ??= new ChangeTrackingList<string>();
@@ -1524,7 +1524,7 @@ namespace Azure.ResourceManager.ProviderHub.Models
                 endpointUri,
                 (locations ?? new ChangeTrackingList<string>()).ToList(),
                 (requiredFeatures ?? new ChangeTrackingList<string>()).ToList(),
-                new ProviderFeaturesRule(requiredFeaturesPolicy, default),
+                requiredFeaturesPolicy is null ? default : new ProviderFeaturesRule(requiredFeaturesPolicy.GetValueOrDefault(), default),
                 timeout,
                 endpointType,
                 dstsConfiguration,
